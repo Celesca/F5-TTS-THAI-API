@@ -263,7 +263,7 @@ async def text_to_speech(
     gen_text: str = Form(...),
     remove_silence: bool = Form(True),
     cross_fade_duration: float = Form(0.15),
-    nfe_step: int = Form(32),
+    nfe_step: int = Form(16),
     speed: float = Form(1.0),
     cfg_strength: float = Form(2.0),
     max_chars: int = Form(250),
