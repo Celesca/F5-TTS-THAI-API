@@ -1,10 +1,15 @@
 import random
 import sys
 from importlib.resources import files
+import io
+import os
 
 import soundfile as sf
 import tqdm
 from cached_path import cached_path
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import StreamingResponse
 
 from f5_tts.infer.utils_infer import (
     hop_length,
@@ -123,6 +128,8 @@ class F5TTS:
         file_wave=None,
         file_spect=None,
         seed=-1,
+        set_max_chars=250,
+        use_ipa=False,
     ):
         if seed == -1:
             seed = random.randint(0, sys.maxsize)
@@ -148,6 +155,8 @@ class F5TTS:
             speed=speed,
             fix_duration=fix_duration,
             device=self.device,
+            set_max_chars=set_max_chars,
+            use_ipa=use_ipa,
         )
 
         if file_wave is not None:
@@ -160,15 +169,126 @@ class F5TTS:
 
 
 if __name__ == "__main__":
+    # If run directly, start a small FastAPI app for POST-based inference
+    app = FastAPI(title="F5-TTS API")
+
+    # create a single F5TTS instance to reuse models
     f5tts = F5TTS()
 
-    wav, sr, spect = f5tts.infer(
-        ref_file=str(files("f5_tts").joinpath("infer/examples/basic/basic_ref_en.wav")),
-        ref_text="some call me nature, others call me mother nature.",
-        gen_text="""I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring. Respect me and I'll nurture you; ignore me and you shall face the consequences.""",
-        file_wave=str(files("f5_tts").joinpath("../../tests/api_out.wav")),
-        file_spect=str(files("f5_tts").joinpath("../../tests/api_out.png")),
-        seed=-1,  # random seed = -1
-    )
+    # Model defaults (same as webui)
+    default_model_base = "hf://VIZINTZOR/F5-TTS-THAI/model_1000000.pt"
+    v2_model_base = "hf://VIZINTZOR/F5-TTS-TH-v2/model_250000.pt"
+    vocab_base = "./vocab/vocab.txt"
+    vocab_ipa_base = "./vocab/vocab_ipa.txt"
 
-    print("seed :", f5tts.seed)
+    model_choices = ["Default", "V2", "Custom"]
+
+
+    def load_model_choice(model_choice: str = "Default", custom_path: str = ""):
+        """Load and replace the underlying model in the shared f5tts instance."""
+        global f5tts
+        # choose checkpoint and vocab
+        if model_choice == "Default":
+            ckpt = str(cached_path(default_model_base))
+            vocab = vocab_base
+            use_ipa = False
+        elif model_choice == "V2":
+            ckpt = str(cached_path(v2_model_base))
+            vocab = vocab_ipa_base
+            use_ipa = True
+        elif model_choice == "Custom":
+            if not custom_path:
+                raise ValueError("Custom model selected but no model path provided")
+            ckpt = str(cached_path(custom_path))
+            vocab = vocab_base
+            use_ipa = False
+        else:
+            raise ValueError("Unknown model choice")
+
+        # Reinitialize model weights (keep existing configs)
+        f5tts.load_ema_model(f5tts.ema_model.transformer.config._get_name() if hasattr(f5tts.ema_model, 'transformer') else 'F5-TTS', ckpt, f5tts.mel_spec_type, vocab, 'euler', True)
+        return use_ipa
+
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "device": f5tts.device}
+
+
+    @app.post("/infer")
+    async def infer_endpoint(
+        ref_audio: UploadFile = File(...),
+        ref_text: str = Form(""),
+        gen_text: str = Form(...),
+        remove_silence: bool = Form(True),
+        cross_fade_duration: float = Form(0.15),
+        nfe_step: int = Form(32),
+        speed: float = Form(1.0),
+        cfg_strength: float = Form(2.0),
+        max_chars: int = Form(250),
+        seed: int = Form(-1),
+        use_ipa: bool = Form(False),
+        model_choice: str = Form("Default"),
+        model_custom_path: str = Form(""),
+    ):
+        """Accept multipart/form-data with a reference audio file and text fields, return generated WAV"""
+
+        # Validate upload
+        if ref_audio.content_type.split("/")[0] != "audio":
+            raise HTTPException(status_code=400, detail="ref_audio must be an audio file")
+
+        # Save uploaded file to a temporary file path
+        import tempfile
+
+        try:
+            suffix = os.path.splitext(ref_audio.filename)[1] or ".wav"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                content = await ref_audio.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            # Optionally load model choice
+            if model_choice and model_choice in model_choices:
+                try:
+                    auto_ipa = load_model_choice(model_choice, model_custom_path)
+                    # prefer explicit use_ipa param if provided, otherwise use model default
+                    if not use_ipa:
+                        use_ipa = auto_ipa
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
+
+            # Run inference
+            wav, sr, spect = f5tts.infer(
+                ref_file=tmp_path,
+                ref_text=ref_text,
+                gen_text=gen_text,
+                remove_silence=remove_silence,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                speed=speed,
+                cfg_strength=cfg_strength,
+                file_wave=None,
+                file_spect=None,
+                seed=seed,
+                set_max_chars=max_chars,
+                use_ipa=use_ipa,
+            )
+
+            # Write generated wave to bytes buffer
+            buffer = io.BytesIO()
+            sf.write(buffer, wav, sr, format="WAV")
+            buffer.seek(0)
+
+            return StreamingResponse(buffer, media_type="audio/wav")
+
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+    # To run the app: uvicorn src.f5_tts.api:app --reload
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=7860)
