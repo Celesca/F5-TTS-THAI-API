@@ -33,6 +33,7 @@ from f5_tts.model.utils import (
     get_tokenizer,
     convert_char_to_pinyin,
 )
+import inspect
 
 _ref_audio_cache = {}
 
@@ -258,8 +259,38 @@ def load_model(
     print("model : ", ckpt_path, "\n")
 
     vocab_char_map, vocab_size = get_tokenizer(vocab_file, tokenizer)
+
+    # Debug: print which class/module we're instantiating and its constructor signature
+    try:
+        cls_module = getattr(model_cls, "__module__", "unknown")
+        cls_name = getattr(model_cls, "__name__", str(model_cls))
+        sig = inspect.signature(model_cls.__init__)
+        print(f"Instantiating model class: {cls_name} (module: {cls_module})")
+        print(f"Constructor signature: {sig}")
+    except Exception:
+        pass
+
+    # Filter model_cfg to only pass kwargs accepted by the model constructor
+    try:
+        sig = inspect.signature(model_cls.__init__)
+        params = sig.parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_var_kw:
+            filtered_cfg = dict(model_cfg)
+        else:
+            allowed = {name for name, p in params.items() if name != "self" and p.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY
+            )}
+            filtered_cfg = {k: v for k, v in model_cfg.items() if k in allowed}
+            dropped = [k for k in model_cfg.keys() if k not in filtered_cfg]
+            if dropped:
+                print(f"Dropped unsupported model_cfg keys for {cls_name}: {dropped}")
+    except Exception as e:
+        print(f"Warning: failed to inspect model constructor: {e}")
+        filtered_cfg = dict(model_cfg)
+
     model = CFM(
-        transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
+        transformer=model_cls(**filtered_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=dict(
             n_fft=n_fft,
             hop_length=hop_length,
