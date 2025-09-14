@@ -268,7 +268,8 @@ async def text_to_speech(
     cfg_strength: float = Form(2.0),
     max_chars: int = Form(250),
     seed: int = Form(-1),
-    lang_process: str = Form("Default")
+    lang_process: str = Form("Default"),
+    return_file: bool = Form(False),
 ):
     global f5tts_model, vocoder
     
@@ -331,7 +332,12 @@ async def text_to_speech(
         
         # Clean up temporary file
         os.unlink(ref_audio_path)
-        
+
+        # If the caller requested the file back directly, stream it
+        if return_file:
+            # Return the WAV file as attachment
+            return FileResponse(path=str(output_path), media_type="audio/wav", filename=output_filename)
+
         return TTSResponse(
             success=True,
             audio_file=str(output_path),
