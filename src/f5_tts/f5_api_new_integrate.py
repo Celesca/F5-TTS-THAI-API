@@ -317,7 +317,7 @@ async def text_to_speech(
     try:
         # Use cached reference if no new one provided
         if ref_audio is None and cached_ref_processed is not None:
-            ref_audio_processed, ref_text_processed = cached_ref_processed, cached_ref_text
+            ref_audio_processed, ref_text_processed = cached_ref_processed
             ref_audio_path = cached_ref_audio  # For cleanup
         else:
             # Process new reference
