@@ -43,11 +43,13 @@ vocab_ipa_base = os.path.join(ROOT_DIR, "vocab", "vocab_ipa.txt")
 # Global variables
 f5tts_model = None
 vocoder = None
+device = None
 
 # Cached reference data for speed optimization
 cached_ref_audio = None
 cached_ref_text = None
 cached_ref_processed = None  # Preprocessed reference data
+cached_cleaned_text = {}  # Cache for cleaned text to avoid repeated processing
 
 # Initialize FastAPI router
 router = APIRouter(
@@ -153,9 +155,22 @@ async def save_upload_file(upload_file: UploadFile) -> str:
 # Startup event to initialize models
 @router.on_event("startup")
 async def startup_event():
-    global f5tts_model, vocoder
+    global f5tts_model, vocoder, device
     try:
+        # Set device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {device}")
+        
+        # Enable cuDNN optimizations for faster convolution
+        if device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+            print("cuDNN benchmark enabled for optimized performance")
+        
         vocoder = load_vocoder()
+        # Move vocoder to device if it's a torch model
+        if hasattr(vocoder, 'to'):
+            vocoder = vocoder.to(device)
+        
         # Diagnostic: print resolved vocab paths and DiT constructor signature
         try:
             import inspect
@@ -181,7 +196,9 @@ async def startup_event():
             pass
 
         f5tts_model = load_f5tts(str(cached_path(default_model_base)))
-        print("Models loaded successfully")
+        # Move model to device
+        f5tts_model = f5tts_model.to(device)
+        print("Models loaded successfully and moved to device")
     except Exception as e:
         print(f"Error loading models: {e}")
 
@@ -225,12 +242,14 @@ async def health_check():
         "status": "healthy", 
         "models_loaded": f5tts_model is not None and vocoder is not None,
         "api_version": "1.0.0",
-        "reference_cached": cached_ref_processed is not None
+        "reference_cached": cached_ref_processed is not None,
+        "device": str(device) if device else "cpu",
+        "text_cache_size": len(cached_cleaned_text)
     }
 
 @router.post("/load_model", response_model=ModelLoadResponse)
 async def load_custom_model(request: ModelLoadRequest):
-    global f5tts_model
+    global f5tts_model, device
     try:
         torch.cuda.empty_cache()
         
@@ -247,6 +266,10 @@ async def load_custom_model(request: ModelLoadRequest):
                 model_type="v2" if request.model_choice == "V2" else "v1"
             )
             message = f"Loaded Model {request.model_choice}"
+        
+        # Move model to device
+        if device is not None:
+            f5tts_model = f5tts_model.to(device)
         
         return ModelLoadResponse(success=True, message=message)
     except Exception as e:
@@ -294,6 +317,17 @@ async def clear_reference():
     except Exception as e:
         return {"error": f"Failed to clear cache: {str(e)}"}
 
+@router.delete("/clear_text_cache")
+async def clear_text_cache():
+    """Clear cached cleaned text data"""
+    global cached_cleaned_text
+    
+    try:
+        cached_cleaned_text.clear()
+        return {"message": "Text cache cleared", "previous_size": len(cached_cleaned_text)}
+    except Exception as e:
+        return {"error": f"Failed to clear text cache: {str(e)}"}
+
 @router.post("/tts", response_model=TTSResponse)
 async def text_to_speech(
     ref_audio: UploadFile = File(None),  # Optional: use cached if not provided
@@ -301,12 +335,12 @@ async def text_to_speech(
     gen_text: str = Form(...),
     remove_silence: bool = Form(True),
     cross_fade_duration: float = Form(0.15),
-    nfe_step: int = Form(16),
+    nfe_step: int = Form(8),  # Reduced from 16 for faster inference (8-16 recommended)
     speed: float = Form(1.0),
     cfg_strength: float = Form(2.0),
     max_chars: int = Form(250),
     seed: int = Form(-1),
-    lang_process: str = Form("Default"),
+    fast_mode: bool = Form(False),  # Enable fast mode: lower quality settings for speed
     return_file: bool = Form(False),
 ):
     global f5tts_model, vocoder, cached_ref_processed, cached_ref_text
@@ -326,6 +360,10 @@ async def text_to_speech(
             ref_audio_path = await save_upload_file(ref_audio)
             ref_audio_processed, ref_text_processed = preprocess_ref_audio_text(ref_audio_path, ref_text)
         
+        # Move tensors to device
+        if device is not None and isinstance(ref_audio_processed, torch.Tensor):
+            ref_audio_processed = ref_audio_processed.to(device)
+        
         # Set seed
         if seed == -1:
             seed = random.randint(0, sys.maxsize)
@@ -335,10 +373,27 @@ async def text_to_speech(
         if not gen_text.strip():
             raise HTTPException(status_code=400, detail="Generated text cannot be empty")
         
-        # Clean generated text
-        gen_text_cleaned = process_thai_repeat(replace_numbers_with_thai(gen_text))
+        # Clean generated text (with caching)
+        if gen_text in cached_cleaned_text:
+            gen_text_cleaned = cached_cleaned_text[gen_text]
+        else:
+            gen_text_cleaned = process_thai_repeat(replace_numbers_with_thai(gen_text))
+            cached_cleaned_text[gen_text] = gen_text_cleaned
+        
+        # Apply fast mode settings
+        if fast_mode:
+            nfe_step = min(nfe_step, 4)  # Very fast inference
+            remove_silence = False  # Skip silence removal for speed
+            cfg_strength = min(cfg_strength, 1.5)  # Reduce CFG for speed
         
         # Generate audio
+        # Performance tips:
+        # - Use GPU for significant speedup (automatically enabled)
+        # - Lower nfe_step (8-16) for faster inference with slight quality trade-off
+        # - Cache reference data to avoid preprocessing
+        # - Cache text cleaning for repeated text
+        # - Set remove_silence=False for fastest generation
+        # - Use fast_mode=True for maximum speed
         final_wave, final_sample_rate, combined_spectrogram = infer_process(
             ref_audio_processed,
             ref_text_processed,
