@@ -44,6 +44,11 @@ vocab_ipa_base = os.path.join(ROOT_DIR, "vocab", "vocab_ipa.txt")
 f5tts_model = None
 vocoder = None
 
+# Cached reference data for speed optimization
+cached_ref_audio = None
+cached_ref_text = None
+cached_ref_processed = None  # Preprocessed reference data
+
 # Initialize FastAPI router
 router = APIRouter(
     tags=["TTS"],
@@ -219,7 +224,8 @@ async def health_check():
     return {
         "status": "healthy", 
         "models_loaded": f5tts_model is not None and vocoder is not None,
-        "api_version": "1.0.0"
+        "api_version": "1.0.0",
+        "reference_cached": cached_ref_processed is not None
     }
 
 @router.post("/load_model", response_model=ModelLoadResponse)
@@ -246,10 +252,52 @@ async def load_custom_model(request: ModelLoadRequest):
     except Exception as e:
         return ModelLoadResponse(success=False, message=f"Error loading model: {str(e)}")
 
+@router.post("/set_reference")
+async def set_reference(
+    ref_audio: UploadFile = File(...),
+    ref_text: str = Form(...)
+):
+    """Cache reference audio and text for faster TTS generation"""
+    global cached_ref_audio, cached_ref_text, cached_ref_processed
+    
+    try:
+        # Save uploaded audio file
+        ref_audio_path = await save_upload_file(ref_audio)
+        
+        # Cache the raw data
+        cached_ref_audio = ref_audio_path
+        cached_ref_text = ref_text
+        
+        # Preprocess and cache the processed data
+        cached_ref_processed = preprocess_ref_audio_text(ref_audio_path, ref_text)
+        
+        return {"message": "Reference cached successfully", "ref_text": ref_text}
+    except Exception as e:
+        return {"error": f"Failed to cache reference: {str(e)}"}
+
+@router.delete("/clear_reference")
+async def clear_reference():
+    """Clear cached reference data"""
+    global cached_ref_audio, cached_ref_text, cached_ref_processed
+    
+    try:
+        # Clean up cached audio file if it exists
+        if cached_ref_audio and os.path.exists(cached_ref_audio):
+            os.unlink(cached_ref_audio)
+        
+        # Clear cache
+        cached_ref_audio = None
+        cached_ref_text = None
+        cached_ref_processed = None
+        
+        return {"message": "Reference cache cleared"}
+    except Exception as e:
+        return {"error": f"Failed to clear cache: {str(e)}"}
+
 @router.post("/tts", response_model=TTSResponse)
 async def text_to_speech(
-    ref_audio: UploadFile = File(...),
-    ref_text: str = Form(...),
+    ref_audio: UploadFile = File(None),  # Optional: use cached if not provided
+    ref_text: str = Form(None),          # Optional: use cached if not provided
     gen_text: str = Form(...),
     remove_silence: bool = Form(True),
     cross_fade_duration: float = Form(0.15),
@@ -261,14 +309,22 @@ async def text_to_speech(
     lang_process: str = Form("Default"),
     return_file: bool = Form(False),
 ):
-    global f5tts_model, vocoder
+    global f5tts_model, vocoder, cached_ref_processed, cached_ref_text
     
     if f5tts_model is None:
         f5tts_model = load_f5tts(str(cached_path(default_model_base)))
 
     try:
-        # Save uploaded audio file
-        ref_audio_path = await save_upload_file(ref_audio)
+        # Use cached reference if no new one provided
+        if ref_audio is None and cached_ref_processed is not None:
+            ref_audio_processed, ref_text_processed = cached_ref_processed, cached_ref_text
+            ref_audio_path = cached_ref_audio  # For cleanup
+        else:
+            # Process new reference
+            if ref_audio is None or ref_text is None:
+                raise HTTPException(status_code=400, detail="Reference audio and text are required if not cached")
+            ref_audio_path = await save_upload_file(ref_audio)
+            ref_audio_processed, ref_text_processed = preprocess_ref_audio_text(ref_audio_path, ref_text)
         
         # Set seed
         if seed == -1:
@@ -278,9 +334,6 @@ async def text_to_speech(
         # Validate inputs
         if not gen_text.strip():
             raise HTTPException(status_code=400, detail="Generated text cannot be empty")
-        
-        # Preprocess reference audio and text
-        ref_audio_processed, ref_text_processed = preprocess_ref_audio_text(ref_audio_path, ref_text)
         
         # Clean generated text
         gen_text_cleaned = process_thai_repeat(replace_numbers_with_thai(gen_text))
@@ -320,8 +373,9 @@ async def text_to_speech(
         spectrogram_path = output_dir / spectrogram_filename
         save_spectrogram(combined_spectrogram, str(spectrogram_path))
         
-        # Clean up temporary file
-        os.unlink(ref_audio_path)
+        # Clean up temporary file (only if not using cached)
+        if ref_audio is not None:
+            os.unlink(ref_audio_path)
 
         # If the caller requested the file back directly, stream it
         if return_file:
