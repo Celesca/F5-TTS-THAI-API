@@ -269,6 +269,8 @@ async def text_to_speech(
     max_chars: int = Form(250),
     seed: int = Form(-1),
     lang_process: str = Form("Default"),
+    sway_sampling_coef: float = Form(-1.0),  # Sway Sampling: focuses power on early generation stages
+    use_epss: bool = Form(True),  # EPSS: Empirically Pruned Step Sampling for faster inference
     return_file: bool = Form(False),
 ):
     global f5tts_model, vocoder
@@ -295,7 +297,7 @@ async def text_to_speech(
         # Clean generated text
         gen_text_cleaned = process_thai_repeat(replace_numbers_with_thai(gen_text))
         
-        # Generate audio
+        # Generate audio with Sway Sampling and EPSS for better quality
         final_wave, final_sample_rate, combined_spectrogram = infer_process(
             ref_audio_processed,
             ref_text_processed,
@@ -306,6 +308,7 @@ async def text_to_speech(
             nfe_step=nfe_step,
             speed=speed,
             cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
             set_max_chars=max_chars,
         )
         

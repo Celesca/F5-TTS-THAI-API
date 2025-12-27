@@ -340,6 +340,8 @@ async def text_to_speech(
     cfg_strength: float = Form(2.0),
     max_chars: int = Form(250),
     seed: int = Form(-1),
+    sway_sampling_coef: float = Form(-1.0),  # Sway Sampling: focuses power on early generation stages
+    use_epss: bool = Form(True),  # EPSS: Empirically Pruned Step Sampling for faster inference
     fast_mode: bool = Form(False),  # Enable fast mode: lower quality settings for speed
     return_file: bool = Form(False),
 ):
@@ -386,7 +388,7 @@ async def text_to_speech(
             remove_silence = False  # Skip silence removal for speed
             cfg_strength = min(cfg_strength, 1.5)  # Reduce CFG for speed
         
-        # Generate audio
+        # Generate audio with Sway Sampling and EPSS for better quality
         # Performance tips:
         # - Use GPU for significant speedup (automatically enabled)
         # - Lower nfe_step (8-16) for faster inference with slight quality trade-off
@@ -394,6 +396,7 @@ async def text_to_speech(
         # - Cache text cleaning for repeated text
         # - Set remove_silence=False for fastest generation
         # - Use fast_mode=True for maximum speed
+        # - sway_sampling_coef=-1.0 enables Sway Sampling for better speech structure
         final_wave, final_sample_rate, combined_spectrogram = infer_process(
             ref_audio_processed,
             ref_text_processed,
@@ -404,6 +407,7 @@ async def text_to_speech(
             nfe_step=nfe_step,
             speed=speed,
             cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
             set_max_chars=max_chars,
         )
         
